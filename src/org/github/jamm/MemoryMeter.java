@@ -6,9 +6,12 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
 
@@ -56,11 +59,18 @@ public class MemoryMeter {
 
     public MemoryMeter() {
         this(new Callable<Set<Object>>() {
-            public Set<Object> call() throws Exception {
-                // using a normal HashSet to track seen objects screws things up in two ways:
-                // - it can undercount objects that are "equal"
-                // - calling equals() can actually change object state (e.g. creating entrySet in HashMap)
-                return Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        	private final ThreadLocal<Set<Object>> reusedSet = new ThreadLocal<Set<Object>>() {
+        		@Override protected Set<Object> initialValue() {
+                    // using a normal HashSet to track seen objects screws things up in two ways:
+                    // - it can undercount objects that are "equal"
+                    // - calling equals() can actually change object state (e.g. creating entrySet in HashMap)
+        			return Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        		}
+        	};
+            public Set<Object> call() {
+            	Set<Object> set = reusedSet.get();
+            	if(!set.isEmpty()) set.clear();
+                return set;
             }
         }, true, Guess.NEVER, false, false, false, NoopMemoryMeterListener.FACTORY);
     }
@@ -223,6 +233,31 @@ public class MemoryMeter {
                 return instrumentation.getObjectSize(object);
         }
     }
+    
+    private static final ThreadLocal<Map<Class<?>,Long>> sizeCache = new ThreadLocal<Map<Class<?>,Long>>() {
+    	@Override protected Map<Class<?>,Long> initialValue() {
+    		return new HashMap<Class<?>,Long>();
+    	}
+    };
+    
+    private static long getSize(Map<Class<?>,Long> cache, Class<?> type) {
+    	Long size = cache.get(type);
+    	if(size == null) cache.put(type, size = MemoryLayoutSpecification.sizeOfInstanceWithUnsafe(type));
+    	return size;
+    }
+    
+    public static long sizeOfWithUnsafe(Map<Class<?>,Long> cache, Object obj) {
+        Class<?> type = obj.getClass();
+        if (type.isArray())
+            return MemoryLayoutSpecification.sizeOfArray(obj, type);
+        return getSize(cache, type);
+    }
+
+    private static final ThreadLocal<Deque<Object>> stackTl = new ThreadLocal<Deque<Object>>() {
+    	@Override protected Deque<Object> initialValue() {
+    		return new ArrayDeque<Object>();
+    	};
+    };
 
     /**
      * @return the memory usage of @param object including referenced objects
@@ -232,8 +267,10 @@ public class MemoryMeter {
         if (object == null) {
             throw new NullPointerException(); // match getObjectSize behavior
         }
+        
+        Map<Class<?>,ClassInfo> map = classCache.get();
 
-        if (ignoreClass(object.getClass()))
+        if (getFields(map, object.getClass()) == null)
             return 0;
 
         Set<Object> tracker;
@@ -243,35 +280,42 @@ public class MemoryMeter {
         catch (Exception e) {
             throw new RuntimeException(e);
         }
-        MemoryMeterListener listener = listenerFactory.newInstance();
+        Deque<Object> stack = stackTl.get();
+        try {
+            MemoryMeterListener listener = listenerFactory.newInstance();
 
-        tracker.add(object);
-        listener.started(object);
+            tracker.add(object);
+            listener.started(object);
 
-        // track stack manually so we can handle deeper hierarchies than recursion
-        Deque<Object> stack = new ArrayDeque<Object>();
-        stack.push(object);
+            // track stack manually so we can handle deeper hierarchies than recursion
+            stack.push(object);
 
-        long total = 0;
-        while (!stack.isEmpty()) {
-            Object current = stack.pop();
-            assert current != null;
-            long size = measure(current);
-            listener.objectMeasured(current, size);
-            total += size;
+            Map<Class<?>,Long> szCache = sizeCache.get();
 
-            if (current instanceof Object[]) {
-                addArrayChildren((Object[]) current, stack, tracker, listener);
-            } else if (current instanceof ByteBuffer && !includeFullBufferSize) {
-                total += ((ByteBuffer) current).remaining();
-            } else {
-            	Object referent = (ignoreNonStrongReferences && (current instanceof Reference)) ? ((Reference<?>)current).get() : null;
-                addFieldChildren(current, stack, tracker, referent, listener);
+            long total = 0;
+            while (!stack.isEmpty()) {
+                Object current = stack.pop();
+                assert current != null;
+                long size = /* measure(current); */ sizeOfWithUnsafe(szCache, current);
+                listener.objectMeasured(current, size);
+                total += size;
+
+                if (current instanceof Object[]) {
+                    addArrayChildren((Object[]) current, stack, tracker, listener, map);
+                } else if (current instanceof ByteBuffer && !includeFullBufferSize) {
+                    total += ((ByteBuffer) current).remaining();
+                } else {
+                    Object referent = (ignoreNonStrongReferences && (current instanceof Reference)) ? ((Reference<?>)current).get() : null;
+                    addFieldChildren(current, stack, tracker, referent, listener, map);
+                }
             }
-        }
 
-        listener.done(total);
-        return total;
+            listener.done(total);
+            return total;
+        } finally {
+            stack.clear();
+            tracker.clear();
+        }
     }
 
     /**
@@ -287,64 +331,116 @@ public class MemoryMeter {
         Set<Object> tracker = Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
         tracker.add(object);
         listener.started(object);
-        Deque<Object> stack = new ArrayDeque<Object>();
-        stack.push(object);
+        Deque<Object> stack = stackTl.get();
+        try {
+            stack.push(object);
 
-        long total = 0;
-        while (!stack.isEmpty()) {
-            Object current = stack.pop();
-            assert current != null;
-            total++;
-            listener.objectCounted(current);
+            Map<Class<?>,ClassInfo> map = classCache.get();
 
-            if (current instanceof Object[]) {
-                addArrayChildren((Object[]) current, stack, tracker, listener);
+            long total = 0;
+            while (!stack.isEmpty()) {
+                Object current = stack.pop();
+                assert current != null;
+                total++;
+                listener.objectCounted(current);
+
+                if (current instanceof Object[]) {
+                    addArrayChildren((Object[]) current, stack, tracker, listener, map);
+                } else {
+                    Object referent = (ignoreNonStrongReferences && (current instanceof Reference)) ? ((Reference<?>)current).get() : null;
+                    addFieldChildren(current, stack, tracker, referent, listener, map);
+                }
+            }
+
+            listener.done(total);
+            return total;
+        } finally {
+            stack.clear();
+        }
+    }
+      
+    private final ThreadLocal<Map<Class<?>,ClassInfo>> classCache = new ThreadLocal<Map<Class<?>,ClassInfo>>() {
+    	@Override protected Map<Class<?>,ClassInfo> initialValue() {
+    		return new HashMap<Class<?>,ClassInfo>();
+    	}
+    };
+    
+    class ClassInfo {
+        final ArrayList<Field> fields;
+        final Class<?> sc;
+//      final long size;
+        public ClassInfo(Class<?> clz, Map<Class<?>,ClassInfo> map) {
+            if(clz == null) {
+                this.sc = null;
+                this.fields = null;
+//              this.size = 0L;
             } else {
-            	Object referent = (ignoreNonStrongReferences && (current instanceof Reference)) ? ((Reference<?>)current).get() : null;
-                addFieldChildren(current, stack, tracker, referent, listener);
+                this.sc = clz.getSuperclass();
+                Field[] dfields = clz.getDeclaredFields();
+                fields = new ArrayList<Field>(dfields.length);
+                for (Field field : dfields) {
+                    if (field.getType().isPrimitive()
+                            || Modifier.isStatic(field.getModifiers())
+                            || field.isAnnotationPresent(Unmetered.class)) {
+                        continue;
+                    }
+
+                    if (ignoreOuterClassReference && field.getName().matches(outerClassReference)) {
+                        continue;
+                    }
+
+                    if (ignoreClass(field.getType())) {
+                        continue;
+                    }
+
+                    field.setAccessible(true);
+                    fields.add(field);
+                }
+                fields.trimToSize();
+//              size = MemoryLayoutSpecification.sizeOfInstanceWithUnsafe(clz);
             }
         }
-
-        listener.done(total);
-        return total;
     }
+    
+    private final ClassInfo IGNORE = new ClassInfo(null,null);
+    
+    private ClassInfo getFields(Map<Class<?>,ClassInfo> map, Class<?> clz) {
+        if(clz == null) return null;
+//      Map<Class<?>,FieldsAndSC> map = classCache.get();
+        ClassInfo fields = map.get(clz);
+        if(fields == null) {
+            map.put(clz, fields = ignoreClass(clz) ? IGNORE : new ClassInfo(clz,map));
+        }
+        return fields == IGNORE ? null : fields;
+    }
+    
+    private static final MemoryMeterListener NMML = NoopMemoryMeterListener.FACTORY.newInstance();
 
-    private void addFieldChildren(Object current, Deque<Object> stack, Set<Object> tracker, Object ignorableChild, MemoryMeterListener listener) {
+    private void addFieldChildren(Object current, Deque<Object> stack, Set<Object> tracker, Object ignorableChild, MemoryMeterListener listener,
+    		Map<Class<?>,ClassInfo> map) {
         Class<?> cls = current.getClass();
         while (!skipClass(cls)) {
-            for (Field field : cls.getDeclaredFields()) {
-                if (field.getType().isPrimitive()
-                        || Modifier.isStatic(field.getModifiers())
-                        || field.isAnnotationPresent(Unmetered.class)) {
-                    continue;
-                }
-                
-                if (ignoreOuterClassReference && field.getName().matches(outerClassReference)) {
-                	continue;
-                }
-
-                if (ignoreClass(field.getType())) {
-                	continue;
-                }
-
-                field.setAccessible(true);
+            ClassInfo fields = getFields(map, cls);
+            ArrayList<Field> fieldsList = fields.fields;
+            for(int i=0,len=fieldsList.size();i<len;i++) {
+                Field field = fieldsList.get(i);
                 Object child;
                 try {
                     child = field.get(current);
                 } catch (IllegalAccessException e) {
                     throw new RuntimeException(e);
                 }
-                
-                if (child != ignorableChild) {
-	                if (child != null && !tracker.contains(child)) {
-	                    stack.push(child);
-	                    tracker.add(child);
-	                    listener.fieldAdded(current, field.getName(), child);
-	                }
+
+                if (child != null && child != ignorableChild
+                        && getFields(map,child.getClass())!=null) {
+                    if (tracker.add(child)) {
+                        stack.push(child);
+                        if(listener != NMML) listener.fieldAdded(current, field.getName(), child);
+                    }
                 }
             }
 
-            cls = cls.getSuperclass();
+            cls = fields.sc;
         }
     }
 
@@ -402,19 +498,20 @@ public class MemoryMeter {
         return isAnnotationPresent(cls.getSuperclass());
     }
 
-    private void addArrayChildren(Object[] current, Deque<Object> stack, Set<Object> tracker, MemoryMeterListener listener) {
+    private void addArrayChildren(Object[] current, Deque<Object> stack, Set<Object> tracker, MemoryMeterListener listener,
+    		Map<Class<?>,ClassInfo> map) {
         for (int i = 0; i < current.length; i++) {
             Object child = current[i];
-            if (child != null && !tracker.contains(child)) {
+            if (child != null && tracker.add(child)) {
             	
                 Class<?> childCls = child.getClass();
-                if (ignoreClass(childCls)) {
+                if (getFields(map, childCls) == null) {
+                	tracker.remove(child);
                 	continue;
                 }
                 
                 stack.push(child);
-                tracker.add(child);
-                listener.fieldAdded(current, Integer.toString(i) , child);
+                if(listener != NMML) listener.fieldAdded(current, Integer.toString(i) , child);
             }
         }
     }
